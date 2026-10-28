@@ -6,7 +6,8 @@ import { WebNetworkCaptureService } from "../../src/application/WebNetworkCaptur
 import { decodeHarCapture } from "../../src/browser/history/HarCapture.js";
 import { deliverCliAnalysisEvidence } from "../../src/cli/analysisEvidenceDelivery.js";
 import { analysisErrorProjectionSchema } from "../../src/contracts/errorSchemas.js";
-import { ok } from "../../src/domain/result.js";
+import { AnalysisTimeoutError } from "../../src/domain/analysisErrorCore.js";
+import { err, ok } from "../../src/domain/result.js";
 import { historicalHar } from "../fixtures/historicalHar.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 
@@ -103,6 +104,74 @@ it.each([true, false])(
     expect(JSON.parse(persisted.toString())).toHaveProperty(
       "records.0.operation",
       "inspect_web_network_capture",
+    );
+  },
+);
+
+it.each([true, false])(
+  "publishes partial Evidence from a failure while excluding only a marked receipt identity: %s",
+  async (marked) => {
+    const root = await createTestTempDirectory("rea-capture-partial-");
+    const outputPath = join(root, "private-publication-marker.json");
+    const values = marked ? ["private-publication-marker"] : [];
+    const bytes = JSON.stringify(historicalHar());
+    const input = {
+      capture_path: join(root, "capture.har"),
+      format: "har" as const,
+      sensitive_values: values,
+    };
+    const service = new WebNetworkCaptureService({
+      inspect: async () =>
+        ok({
+          ...decodeHarCapture(bytes, values),
+          artifact: {
+            path: input.capture_path,
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+            bytes: Buffer.byteLength(bytes),
+          },
+          format: "har" as const,
+          runtime_attribution: "unknown" as const,
+          limitations: [],
+        }),
+    });
+    const completed = await service.inspect(input);
+    if (!completed.ok) throw completed.error;
+    const output = analysisErrorProjectionSchema.parse(
+      await deliverCliAnalysisEvidence({
+        run: async () =>
+          err(
+            new AnalysisTimeoutError("inspect_web_network_capture", 1, {
+              partialObservation: completed.value,
+            }),
+          ),
+        service,
+        providerId: "web-network-capture",
+        operation: "inspect_web_network_capture",
+        signal: new AbortController().signal,
+        detail: "summary",
+        evidenceOutput: outputPath,
+        sensitiveValues: values,
+      }),
+    );
+    const persisted = await readFile(outputPath);
+    expect(output.code).toBe("provider_timeout");
+    expect(output.details).toHaveProperty(
+      "diagnostics.evidence_bundle.bytes",
+      persisted.length,
+    );
+    if (marked) {
+      expect(output.details).not.toHaveProperty(
+        "diagnostics.evidence_bundle.path",
+      );
+      expect(JSON.stringify(output)).not.toContain(values[0]);
+    } else
+      expect(output.details).toHaveProperty(
+        "diagnostics.evidence_bundle.path",
+        outputPath,
+      );
+    expect(JSON.parse(persisted.toString())).toHaveProperty(
+      "records.0.evidence_id",
+      completed.value.evidence_id,
     );
   },
 );
