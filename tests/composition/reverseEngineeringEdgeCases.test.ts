@@ -9,7 +9,10 @@ import {
   providerSnapshot,
 } from "../support/reverseEngineeringCompositionFixtures.js";
 
-import { TestReverseEngineeringService as ReverseEngineeringService } from "../support/reverseEngineeringService.js";
+import {
+  findsNoExecutable,
+  TestReverseEngineeringService as ReverseEngineeringService,
+} from "../support/reverseEngineeringService.js";
 import {
   AnalysisCapabilityUnavailableError,
   AnalysisResourceConstraintError,
@@ -34,7 +37,10 @@ it("records pathless objdump architecture support as provider capability evidenc
   const service = new CoreReverseEngineeringService({
     commands: createReverseEngineeringCommandPort(process.env),
     digest,
-    run: async () => ({ stdout: "elf64-x86-64", stderr: "" }),
+    processes: {
+      lookup: findsNoExecutable,
+      run: async () => ({ stdout: "elf64-x86-64", stderr: "" }),
+    },
   });
   try {
     const result = await service.inspectWithObjdump({
@@ -77,9 +83,12 @@ it("uses the host environment when the service environment is omitted", async ()
   let observedEnvironment: NodeJS.ProcessEnv | undefined;
   const service = new CoreReverseEngineeringService({
     commands: createReverseEngineeringCommandPort(process.env),
-    run: async (_command, _args, options) => {
-      observedEnvironment = options?.env;
-      return { stdout: "ok", stderr: "" };
+    processes: {
+      lookup: findsNoExecutable,
+      run: async (_command, _args, options) => {
+        observedEnvironment = options?.env;
+        return { stdout: "ok", stderr: "" };
+      },
     },
   });
 
@@ -490,13 +499,16 @@ it("relays caller cancellation to the admitted provider signal", async () => {
   let providerSignal: AbortSignal | undefined;
   const service = new CoreReverseEngineeringService({
     commands: createReverseEngineeringCommandPort(process.env),
-    run: async (_command, _args, options) => {
-      providerSignal = options?.signal;
-      announceStarted?.();
-      await new Promise<void>((resolve) => {
-        releaseRun = resolve;
-      });
-      return { stdout: "captured", stderr: "" };
+    processes: {
+      lookup: findsNoExecutable,
+      run: async (_command, _args, options) => {
+        providerSignal = options?.signal;
+        announceStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseRun = resolve;
+        });
+        return { stdout: "captured", stderr: "" };
+      },
     },
   });
   let operation: ReturnType<typeof service.inspectWithObjdump> | undefined;
@@ -548,7 +560,7 @@ it("passes an AbortSignal-like caller value through without relaying it", async 
   const service = new CoreReverseEngineeringService({
     commands: createReverseEngineeringCommandPort(process.env),
     digest,
-    run,
+    processes: { lookup: findsNoExecutable, run },
   });
 
   try {

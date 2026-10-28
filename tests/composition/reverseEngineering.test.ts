@@ -8,7 +8,10 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 import { digestFile } from "../../src/application/reverse/ReverseEngineeringService.js";
-import { TestReverseEngineeringService as ReverseEngineeringService } from "../support/reverseEngineeringService.js";
+import {
+  findsNoExecutable,
+  TestReverseEngineeringService as ReverseEngineeringService,
+} from "../support/reverseEngineeringService.js";
 import { providerSnapshot } from "../support/reverseEngineeringCompositionFixtures.js";
 import { createReverseEngineeringService } from "../../src/composition/reverseEngineering.js";
 import { projectAnalysisError } from "../../src/domain/analysisErrorProjection.js";
@@ -251,9 +254,12 @@ it("uses one selected environment snapshot for provider selection and execution"
   };
   const calls: { command: string; env: NodeJS.ProcessEnv | undefined }[] = [];
   const service = createReverseEngineeringService(selectedEnvironment, {
-    run: async (command, _args, options) => {
-      calls.push({ command, env: options?.env });
-      return { stdout: "headers", stderr: "" };
+    processes: {
+      lookup: findsNoExecutable,
+      run: async (command, _args, options) => {
+        calls.push({ command, env: options?.env });
+        return { stdout: "headers", stderr: "" };
+      },
     },
   });
   selectedEnvironment.REA_RIZIN_COMMAND = "/changed/rizin";
