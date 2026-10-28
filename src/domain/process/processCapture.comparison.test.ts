@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { jsonValueSchema } from "../jsonValue.js";
 import {
   processScenarioSchema,
   processScenarioCommitment,
@@ -29,6 +30,125 @@ const compareFullyObserved = (
     accountFullyObservedProcessCapture(right),
     options,
   );
+
+it("does not turn unresolved filesystem effects into equality or a definite change", () => {
+  const capture = emptyCapture();
+  const file = {
+    path: "root_0:created.txt",
+    type: "file" as const,
+    mode: 0o644,
+    size: 4,
+    sha256: "a".repeat(64),
+    symlink_target: null,
+  };
+  const known = {
+    path: file.path,
+    status: "created" as const,
+    before: null,
+    after: file,
+  };
+  const unknown = {
+    ...known,
+    status: "unknown" as const,
+    reason: "Prior scope was not observed.",
+  };
+  const withEffect = (effect: typeof known | typeof unknown) => ({
+    ...capture,
+    files_after: [file],
+    filesystem_effects: [effect],
+    filesystem_checkpoints: capture.filesystem_checkpoints.map((checkpoint) =>
+      checkpoint.name === "after_settlement"
+        ? { ...checkpoint, files: [file], effects: [effect] }
+        : checkpoint,
+    ),
+  });
+  const unknownCapture = withEffect(unknown);
+  const knownCapture = withEffect(known);
+  for (const [left, right] of [
+    [unknownCapture, unknownCapture],
+    [unknownCapture, knownCapture],
+    [knownCapture, unknownCapture],
+  ] as const)
+    expect(compareFullyObserved(left, right)).toMatchObject({
+      status: "unknown",
+      filesystem: "unknown",
+      first_divergence: { status: "unknown" },
+    });
+  expect(compareFullyObserved(knownCapture, knownCapture)).toMatchObject({
+    status: "unchanged",
+    filesystem: "unchanged",
+    first_divergence: { status: "none" },
+  });
+});
+
+it("preserves independently observed file changes alongside an unknown effect", () => {
+  const base = emptyCapture();
+  const link = {
+    path: "root_0:legacy-link",
+    type: "symlink" as const,
+    mode: 0o777,
+    size: 1,
+    sha256: null,
+    symlink_target: null,
+    symlink_target_hex: "ff",
+  };
+  const unknown = {
+    path: link.path,
+    status: "unknown" as const,
+    before: link,
+    after: link,
+    reason: "Target bytes were not retained.",
+  };
+  const make = (sha256: string) => {
+    const file = {
+      path: "root_0:known.txt",
+      type: "file" as const,
+      mode: 0o644,
+      size: 4,
+      sha256,
+      symlink_target: null,
+    };
+    const files = [link, file];
+    return {
+      ...base,
+      files_before: files,
+      files_after: files,
+      filesystem_effects: [unknown],
+      filesystem_checkpoints: base.filesystem_checkpoints.map((checkpoint) => ({
+        ...checkpoint,
+        files,
+        effects: checkpoint.name === "after_settlement" ? [unknown] : [],
+      })),
+    };
+  };
+  const left = make("a".repeat(64));
+  const right = make("b".repeat(64));
+  const traceSpecification = {
+    events: [
+      {
+        id: "before",
+        source: "filesystem" as const,
+        exact: jsonValueSchema.parse(left.filesystem_checkpoints[0]),
+        cardinality: { kind: "required" as const },
+      },
+    ],
+    language: {
+      kind: "finite_traces" as const,
+      variants: [{ id: "v", trace: ["before"] }],
+    },
+  };
+  for (const [a, b] of [
+    [left, right],
+    [right, left],
+  ] as const) {
+    for (const options of [undefined, { traceSpecification }])
+      expect(compareFullyObserved(a, b, options)).toMatchObject({
+        filesystem: "changed",
+        status: "changed",
+        first_divergence: { status: "unknown" },
+      });
+  }
+});
 
 it.each(PROCESS_COMPARISON_DIMENSIONS)(
   "requires a contradiction aggregate for a contradictory %s dimension",
