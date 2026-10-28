@@ -1,5 +1,5 @@
 import { inspectSignatureSchema } from "../../../../src/domain/native/nativeInspection.js";
-import { realpath, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "vitest";
 import {
@@ -8,6 +8,7 @@ import {
   machoImage,
 } from "../../../../src/artifacts/apple/MachoImage.fixture.js";
 import { err, ok } from "../../../../src/domain/result.js";
+import { parseExecutableHeader } from "../../../../src/domain/binaryTarget.js";
 import {
   NativeCommandFailure,
   type NativeCommandCapture,
@@ -45,7 +46,11 @@ const signatureTarget = async (
       })),
     ),
   );
-  return nativeMachoTargetForFile(path);
+  const target = await nativeMachoTargetForFile(path);
+  const header = parseExecutableHeader(await readFile(path), "arm64");
+  if (!header.ok || header.value.format !== "mach-o-universal")
+    throw new Error("expected a universal Mach-O fixture");
+  return { ...target, ...header.value };
 };
 
 it("distinguishes a codesign execution failure from an observed unsigned artifact", async () => {
@@ -133,12 +138,49 @@ it("reports unsigned slices when a universal Mach-O has mixed signatures", async
           exit: { code: 1, signal: null },
         }),
         expect.objectContaining({
-          command: expect.arrayContaining(["-a", signedArchitecture]),
+          command: expect.arrayContaining(["-a", "arm64"]),
           exit: { code: 0, signal: null },
         }),
       ]),
     });
   }
+});
+
+it("uses the admitted universal target when codesign describes only its selected slice", async () => {
+  const existing = await signatureTarget();
+  const header = parseExecutableHeader(await readFile(existing.path), "arm64");
+  if (!header.ok || header.value.format !== "mach-o-universal")
+    throw new Error("expected a universal Mach-O fixture");
+  const signed = (await fixture("codesign.txt")).replace(
+    /^Format=.*$/mu,
+    "Format=Mach-O thin (arm64)",
+  );
+  const client = new NativeMacOSProvider(
+    {},
+    signatureRunner({
+      signed,
+      unsigned: await fixture("dyld-inventory/codesign-unsigned.txt"),
+      entitlements: await fixture("entitlements.xml"),
+      unsignedHeader: true,
+    }),
+    "darwin",
+  ).createClient({ ...existing, ...header.value });
+  const execution = await client.execute("inspect_signature", {});
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.result).toMatchObject({
+    signed: true,
+    format: "Mach-O thin (arm64)",
+    limitations: expect.arrayContaining([
+      expect.stringContaining("Partial signature coverage"),
+      "Unsigned Mach-O slices: x86_64.",
+    ]),
+    provenance: expect.arrayContaining([
+      expect.objectContaining({
+        command: expect.arrayContaining(["-a", "x86_64"]),
+        exit: { code: 1, signal: null },
+      }),
+    ]),
+  });
 });
 
 it("rejects nonzero supplemental codesign output that is not an unsigned observation", async () => {
@@ -1088,6 +1130,34 @@ it("reruns nm with its dyld-info pass when a dyld_info export row is unreadable"
     ["-gjU", "--no-dyldinfo"],
     ["-gjU", "-arch"],
   ]);
+});
+
+it("lets codesign select the only slice of a thin arm64e target", async () => {
+  const path = join(
+    await createTestTempDirectory("rea-thin-signature-"),
+    "fixture",
+  );
+  await writeFile(path, machoImage({ cpu: CPU.arm64e }));
+  const calls: (readonly string[])[] = [];
+  const display = (await fixture("codesign.txt")).replace(
+    /^Format=.*$/mu,
+    "Format=Mach-O thin (arm64e)",
+  );
+  const runner: NativeCommandRunner = {
+    run(tool, args, options) {
+      calls.push(args);
+      return new FixtureRunner({ codesign: display }).run(tool, args, options);
+    },
+  };
+  const client = new NativeMacOSProvider({}, runner, "darwin").createClient(
+    await nativeMachoTargetForFile(path),
+  );
+  const result = await client.execute("inspect_signature", {});
+  if (!result.ok) throw result.error;
+  expect(result.value.result).toMatchObject({ signed: true });
+  expect(calls).toHaveLength(3);
+  expect(calls.every((args) => !args.includes("-a"))).toBe(true);
+  await client.close();
 });
 
 it.each(["arm64", "x86_64"] as const)(

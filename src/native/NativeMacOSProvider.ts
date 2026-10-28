@@ -29,7 +29,10 @@ import {
 import { NativeUiCleanupError } from "./NativeUiCleanupError.js";
 import { LldbCallTracer, type NativeCallTracer } from "./LldbCallTracer.js";
 import { observeNativeCalls } from "./NativeCallObservation.js";
-import { realpath } from "node:fs/promises";
+import { realpath, symlink } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
+import { AnalysisCleanupLeaseGroup } from "../artifacts/AnalysisCleanupLease.js";
 
 import { z } from "zod";
 
@@ -89,6 +92,7 @@ import { parseXmlPropertyList } from "../domain/propertyListKeys.js";
 import {
   demangleSwiftSchema,
   inspectPlistSchema,
+  inspectMachoSchema,
   inspectSignatureSchema,
   type InspectSignature,
   listArchitecturesSchema,
@@ -127,7 +131,6 @@ import {
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import type { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import {
   createNativeUiHelperRuntime,
   type NativeUiHelperRuntime,
@@ -213,6 +216,7 @@ class NativeMacOSClient implements AnalysisClient {
   readonly #plistResources = new ArtifactResourceScope();
   readonly #callResources = new ArtifactResourceScope();
   readonly #dispatchResources = new ArtifactResourceScope();
+  readonly #machoOperandResources = new ArtifactResourceScope();
   #nativeUiTail: Promise<void> = Promise.resolve();
   #closed = false;
 
@@ -393,6 +397,10 @@ class NativeMacOSClient implements AnalysisClient {
       "native-dispatch-metadata-target",
     );
     const commandCleanup = await this.#retryNativeCommandCleanup();
+    const machoOperandCleanup = await closeNativeFileScope(
+      this.#machoOperandResources,
+      "macho-operand",
+    );
     let result = await this.tracer.close();
     const cleanupErrors = [
       ...(uiCleanupFailures.length === 0
@@ -403,6 +411,7 @@ class NativeMacOSClient implements AnalysisClient {
       ...(plistCleanup === undefined ? [] : [plistCleanup]),
       ...(callCleanup === undefined ? [] : [callCleanup]),
       ...(dispatchCleanup === undefined ? [] : [dispatchCleanup]),
+      ...(machoOperandCleanup === undefined ? [] : [machoOperandCleanup]),
     ];
     for (const cleanupError of cleanupErrors)
       result = result.ok
@@ -745,13 +754,20 @@ class NativeMacOSClient implements AnalysisClient {
         ),
       );
     const selectedArchitecture = architecture === "x86" ? "i386" : architecture;
+    // A thin Mach-O already identifies its only slice. Its admitted architecture
+    // is a CPU family, which is not necessarily a codesign subtype selector
+    // (for example arm64e). Only universal containers need a selector.
+    const selector =
+      this.target.format === "mach-o-universal"
+        ? ["-a", selectedArchitecture]
+        : [];
     const executablePaths = [
       binding.snapshotPath,
       ...(await canonicalPath(binding.snapshotPath)),
     ];
     const display = await this.#captureSignature(
       binding,
-      ["-d", "-a", selectedArchitecture, "--verbose=4"],
+      ["-d", ...selector, "--verbose=4"],
       signal,
       timeoutMs,
     );
@@ -769,7 +785,7 @@ class NativeMacOSClient implements AnalysisClient {
     if (displayFailure !== null) return err(displayFailure);
     const requirements = await this.#captureSignature(
       binding,
-      ["-d", "-a", selectedArchitecture, "-r-"],
+      ["-d", ...selector, "-r-"],
       signal,
       timeoutMs,
     );
@@ -782,7 +798,7 @@ class NativeMacOSClient implements AnalysisClient {
     if (requirementsFailure !== null) return err(requirementsFailure);
     const entitlements = await this.#captureSignature(
       binding,
-      ["-d", "-a", selectedArchitecture, "--entitlements", ":-"],
+      ["-d", ...selector, "--entitlements", ":-"],
       signal,
       timeoutMs,
     );
@@ -850,7 +866,7 @@ class NativeMacOSClient implements AnalysisClient {
     if (architectures.length > 1) {
       const slices = await this.#inspectSignatureSliceStates(
         binding,
-        parsed.format,
+        architectures,
         executablePaths,
         { captures, limitations },
         signal,
@@ -871,7 +887,7 @@ class NativeMacOSClient implements AnalysisClient {
 
   async #inspectSignatureSliceStates(
     binding: SignatureTargetBinding,
-    format: string | null,
+    architectures: readonly string[],
     executablePaths: readonly string[],
     observation: { captures: NativeCommandCapture[]; limitations: string[] },
     signal: AbortSignal | undefined,
@@ -880,7 +896,7 @@ class NativeMacOSClient implements AnalysisClient {
     const { captures, limitations } = observation;
     const unsigned: string[] = [];
     let unsignedNote: number | undefined;
-    for (const architecture of codeSignArchitectures(format, this.target)) {
+    for (const architecture of architectures) {
       const slice = await this.#captureSignature(
         binding,
         ["-d", "-a", architecture, "--verbose=4"],
@@ -1236,17 +1252,149 @@ class NativeMacOSClient implements AnalysisClient {
           "Active artifact is not Mach-O.",
         ),
       );
-    return inspectNativeMacho({
-      target: this.target,
-      ...(signal === undefined ? {} : { signal }),
-      run: (tool, arguments_, commandSignal, acceptNonZeroIf) =>
-        this.#run("inspect_macho", tool, arguments_, {
-          signal: commandSignal,
-          timeoutMs,
-          ...(acceptNonZeroIf === undefined ? {} : { acceptNonZeroIf }),
-        }),
-      invocation: (capture) => invocation(capture, this.target.path),
-    });
+    const inspect = (otoolOperand?: string) =>
+      inspectNativeMacho({
+        target: this.target,
+        ...(signal === undefined ? {} : { signal }),
+        run: (tool, arguments_, commandSignal, acceptNonZeroIf) =>
+          this.#run(
+            "inspect_macho",
+            tool,
+            tool === "otool" && otoolOperand !== undefined
+              ? arguments_.map((argument) =>
+                  argument === this.target.path ? otoolOperand : argument,
+                )
+              : arguments_,
+            {
+              signal: commandSignal,
+              timeoutMs,
+              ...(acceptNonZeroIf === undefined ? {} : { acceptNonZeroIf }),
+            },
+          ),
+        invocation: (capture) => invocation(capture, this.target.path),
+      });
+    if (!/\([^/]*\)$/u.test(basename(this.target.path))) return inspect();
+    return this.#inspectMachoWithOperand(signal, inspect);
+  }
+
+  async #inspectMachoWithOperand(
+    signal: AbortSignal | undefined,
+    inspect: (
+      operand: string,
+    ) => Promise<Result<NativeObservation, AnalysisError>>,
+  ): Promise<Result<NativeObservation, AnalysisError>> {
+    try {
+      return await this.#machoOperandResources.run(async () => {
+        if (signal?.aborted)
+          return err(
+            new AnalysisCancelledError("inspect_macho", {
+              cause: signal.reason,
+            }),
+          );
+        let root: Pick<PrivateRuntimeRoot, "path" | "close">;
+        try {
+          root = await (this.privateRuntimeRootFactory?.() ??
+            PrivateRuntimeRoot.create({ prefix: "rea-macho-operand-" }));
+        } catch (cause: unknown) {
+          return err(
+            new ProviderAdapterError(IDENTITY.id, "inspect_macho", {
+              cause,
+              diagnostics: {
+                reason: "Unable to create a private otool operand",
+                path: this.target.path,
+              },
+            }),
+          );
+        }
+        const owner = {
+          kind: "lease" as const,
+          resource: root.path,
+          lease: {
+            release: async () => {
+              const commandFailure = await this.#retryNativeCommandCleanup();
+              if (commandFailure !== undefined) throw commandFailure;
+              await root.close();
+            },
+          },
+        };
+        let result: Result<NativeObservation, AnalysisError>;
+        try {
+          const operand = join(root.path, "artifact.macho");
+          await symlink(this.target.path, operand);
+          result = signal?.aborted
+            ? err(
+                new AnalysisCancelledError("inspect_macho", {
+                  cause: signal.reason,
+                }),
+              )
+            : await inspect(operand);
+        } catch (cause: unknown) {
+          result = err(
+            new ProviderAdapterError(IDENTITY.id, "inspect_macho", {
+              cause,
+              diagnostics: {
+                reason: "Unable to prepare the private otool operand",
+                path: this.target.path,
+              },
+            }),
+          );
+        }
+        const released = await this.#machoOperandResources.release(owner);
+        if (released.kind === "failed") {
+          const cleanup = new ProviderCleanupError(
+            IDENTITY.id,
+            [root.path],
+            {
+              reason: "The private otool operand could not be released",
+            },
+            { operation: "inspect_macho", cause: released.cause },
+          );
+          if (result.ok)
+            cleanup.retainPartialObservation(
+              inspectMachoSchema.parse(result.value.result),
+            );
+          new AnalysisCleanupLeaseGroup(cleanup, [released.lease]);
+          const primary = result.ok
+            ? signal?.aborted
+              ? new AnalysisCancelledError("inspect_macho", {
+                  cause: signal.reason,
+                  partialObservation: inspectMachoSchema.parse(
+                    result.value.result,
+                  ),
+                })
+              : undefined
+            : result.error;
+          return err(
+            primary === undefined
+              ? cleanup
+              : analysisErrorWithCleanupFailure(
+                  primary,
+                  cleanup,
+                  "inspect_macho",
+                ).bindCleanupDependencies([primary, cleanup]),
+          );
+        }
+        if (signal?.aborted && result.ok)
+          return err(
+            new AnalysisCancelledError("inspect_macho", {
+              cause: signal.reason,
+              partialObservation: inspectMachoSchema.parse(result.value.result),
+            }),
+          );
+        return result;
+      });
+    } catch (cause: unknown) {
+      const failure = new ProviderCleanupError(
+        IDENTITY.id,
+        this.#machoOperandResources.cleanupResources,
+        {
+          reason: "A previous private otool operand remains owned",
+        },
+        { operation: "inspect_macho", cause },
+      );
+      bindArtifactFileCleanup(cause, failure);
+      return err(failure);
+    }
   }
 
   async #run(
@@ -1451,6 +1599,12 @@ const codeSignArchitectures = (
   format: string | null,
   target: BinaryTarget,
 ): string[] => {
+  // An architecture-selected codesign display describes the selected slice,
+  // not the admitted container. The target owns the container's slice list.
+  if (target.kind === "executable" && target.format === "mach-o-universal")
+    return target.availableArchitectures.map((architecture) =>
+      architecture === "x86" ? "i386" : architecture,
+    );
   const universal = /^Mach-O universal \(([^)\r\n]+)\)$/u.exec(
     format ?? "",
   )?.[1];
